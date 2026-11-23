@@ -222,3 +222,70 @@ for old, new in FOLLOW:
 if changed:
     engine.write_text(text, encoding='utf-8')
     print('engine: follows receivers that come back')
+
+# sender.py + receiver.py: raise TCP socket buffers to 2 MiB and enable
+# TCP_NODELAY.  Windows defaults Wintun (awdl0) TCP buffers to ~64 KiB, which
+# caps AirDrop throughput across AWDL's 20-100 ms slot-hop RTTs at ~0.55 MB/s;
+# 2 MiB buffers + TCP_NODELAY unlocked 4.5 MB/s peak RX in MT7922 live tests.
+TCP_BUF_BYTES = '2 * 1024 * 1024'
+
+sender = pathlib.Path(sys.argv[1]) / 'sender.py'
+stext = sender.read_text(encoding='utf-8')
+old_s = NL.join([
+    '            sock.settimeout(self.timeout)',
+    '            sock.connect((self.host, self.port, 0, self.scope))',
+])
+new_s = NL.join([
+    '            sock.settimeout(self.timeout)',
+    '            for opt in (socket.SO_SNDBUF, socket.SO_RCVBUF):',
+    '                try: sock.setsockopt(socket.SOL_SOCKET, opt, ' + TCP_BUF_BYTES + ')',
+    '                except OSError: pass',
+    '            try: sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)',
+    '            except OSError: pass',
+    '            sock.connect((self.host, self.port, 0, self.scope))',
+])
+if new_s not in stext:
+    if old_s not in stext:
+        sys.exit('sender.py: connect() socket lines moved; update patch-engine.py')
+    stext = stext.replace(old_s, new_s, 1)
+    sender.write_text(stext, encoding='utf-8')
+    print('sender: 2 MiB TCP buffers + TCP_NODELAY')
+
+receiver = pathlib.Path(sys.argv[1]) / 'receiver.py'
+rtext = receiver.read_text(encoding='utf-8')
+old_r = NL.join([
+    '        super().__init__((\'::\', port), Handler)',
+])
+new_r = NL.join([
+    '        super().__init__((\'::\', port), Handler)',
+    '        for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):',
+    '            try: self.socket.setsockopt(socket.SOL_SOCKET, opt, ' + TCP_BUF_BYTES + ')',
+    '            except OSError: pass',
+])
+old_r2 = NL.join([
+    '    def process_request(self, request, client_address):',
+    '        logging.info(\'connection from [%s]:%s\', client_address[0], client_address[1])',
+])
+new_r2 = NL.join([
+    '    def process_request(self, request, client_address):',
+    '        for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):',
+    '            try: request.setsockopt(socket.SOL_SOCKET, opt, ' + TCP_BUF_BYTES + ')',
+    '            except OSError: pass',
+    '        try: request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)',
+    '        except OSError: pass',
+    '        logging.info(\'connection from [%s]:%s\', client_address[0], client_address[1])',
+])
+rchanged = False
+if new_r not in rtext:
+    if old_r not in rtext:
+        sys.exit('receiver.py: __init__ super() line moved; update patch-engine.py')
+    rtext = rtext.replace(old_r, new_r, 1)
+    rchanged = True
+if new_r2 not in rtext:
+    if old_r2 not in rtext:
+        sys.exit('receiver.py: process_request() line moved; update patch-engine.py')
+    rtext = rtext.replace(old_r2, new_r2, 1)
+    rchanged = True
+if rchanged:
+    receiver.write_text(rtext, encoding='utf-8')
+    print('receiver: 2 MiB TCP buffers + TCP_NODELAY')
