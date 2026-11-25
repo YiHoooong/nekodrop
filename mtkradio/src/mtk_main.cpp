@@ -363,8 +363,9 @@ int main(int argc, char **argv) {
   }
 
   /* Runtime channel moves and STA record commands use bounded timeouts so
-   * timesharing and scans never stall the radio for seconds. */
-  dev.move_timeout_ms = 60;
+   * timesharing and scans never stall the radio for seconds. MT7922 5 GHz
+   * CHANNEL_SWITCH can exceed 60 ms (especially on first switch / CN band). */
+  dev.move_timeout_ms = 500;
   dev.sta_cmd_timeout_ms = 500;
 
   std::mutex cmd_mu;

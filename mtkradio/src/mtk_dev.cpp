@@ -1305,9 +1305,9 @@ bool MtkDevice::set_address(const uint8_t address[6]) {
   bss_req.bmc_tx_wlan_idx = 0;
   bss_req.bcn_interval = 100;
   bss_req.dtim_period = 1;
-  bss_req.phymode = 0x1e; /* OFDM + HT + VHT */
+  bss_req.phymode = 0xb1; /* 802.11a + HT5 + VHT + HE5 (Connac2 5 GHz HE80) */
   bss_req.sta_idx = 0;
-  bss_req.nonht_basic_phy = 0x02; /* OFDM */
+  bss_req.nonht_basic_phy = 0x78; /* OFDM | HT | VHT | HE */
 
   if (!mcu_send_uni(MCU_UNI_CMD_BSS_INFO_UPDATE, &bss_req, sizeof(bss_req), true)) {
     log("WARNING: BSS_INFO_UPDATE failed");
@@ -1566,7 +1566,10 @@ bool MtkDevice::set_channel(uint8_t channel, unsigned width_mhz) {
   if (band_changed) {
     if (!mcu_set_chan_cmd(MCU_EXT_CMD_SET_RX_PATH, channel, width_mhz)) return false;
   }
-  if (!mcu_set_chan_cmd(MCU_EXT_CMD_CHANNEL_SWITCH, channel, width_mhz)) return false;
+  if (!mcu_set_chan_cmd(MCU_EXT_CMD_CHANNEL_SWITCH, channel, width_mhz)) {
+    restore_rx_filter();
+    return false;
+  }
 
   if (!_rx_path_set) {
     /* Configure RX filter once via MCU so firmware allows frames from other BSSes. */
@@ -1791,6 +1794,70 @@ bool MtkDevice::mcu_register_peer(uint8_t wcid, const uint8_t mac[6]) {
     log("WARNING: peer STA_REC_UPDATE failed for wcid=" + std::to_string(wcid) + " peer=" +
         mac_str(mac));
     return false;
+  }
+
+  /* Follow-up STA_REC_UPDATE: program Connac2 PHY + HE + HE_V2 + RA + STATE
+   * (80 MHz 2SS MCS 0-11, LDPC, A-MSDU in A-MPDU) so firmware RA can ramp to HE80 2SS. */
+  {
+    constexpr size_t kPhyBytes = 12, kHeBytes = 28, kHeV2Bytes = 28, kRaBytes = 16, kStateBytes = 12;
+    uint8_t ext[8 + kPhyBytes + kHeBytes + kHeV2Bytes + kRaBytes + kStateBytes]{};
+    ext[0] = 0; /* bss_idx */
+    ext[1] = wcid;
+    ext[2] = 5; /* tlv_num */
+    ext[4] = 1; /* is_tlv_append */
+    ext[5] = 0; /* muar_idx */
+
+    auto put16 = [](uint8_t *p, uint16_t v) {
+      p[0] = static_cast<uint8_t>(v & 0xffu);
+      p[1] = static_cast<uint8_t>(v >> 8);
+    };
+    auto put32 = [](uint8_t *p, uint32_t v) {
+      p[0] = static_cast<uint8_t>(v & 0xffu);
+      p[1] = static_cast<uint8_t>((v >> 8) & 0xffu);
+      p[2] = static_cast<uint8_t>((v >> 16) & 0xffu);
+      p[3] = static_cast<uint8_t>((v >> 24) & 0xffu);
+    };
+
+    uint8_t *phy = ext + 8;
+    put16(phy, 0x15); /* STA_REC_PHY */
+    put16(phy + 2, kPhyBytes);
+    put16(phy + 4, 0x0540);
+    phy[6] = (1u << 3) | (1u << 4) | (1u << 5) | (1u << 6); /* OFDM | HT | VHT | HE */
+    phy[7] = 0x1du; /* HT AMPDU: 16 KiB, 16 us fallback */
+
+    uint8_t *he = phy + kPhyBytes;
+    put16(he, 0x0e); /* STA_REC_HE */
+    put16(he + 2, kHeBytes);
+    put32(he + 4, (1u << 6) | (1u << 4)); /* LDPC | A-MSDU in A-MPDU */
+    he[10] = 2; /* 80 MHz directly */
+    he[18] = 2; /* 16 us nominal packet padding */
+    put16(he + 20, 0xfffau); /* 2SS MCS 0-11 */
+
+    uint8_t *he_v2 = he + kHeBytes;
+    put16(he_v2, 0x19); /* STA_REC_HE_V2 */
+    put16(he_v2 + 2, kHeV2Bytes);
+    he_v2[8] = 0x40; /* A-MSDU in A-MPDU */
+    he_v2[10] = 0x04; /* 5 GHz 40/80 MHz */
+    he_v2[11] = 0x20; /* LDPC */
+    he_v2[21] = 2;
+    put16(he_v2 + 22, 0xfffau); /* 2SS MCS 0-11 */
+
+    uint8_t *ra = he_v2 + kHeV2Bytes;
+    put16(ra, 0x01); /* STA_REC_RA */
+    put16(ra + 2, kRaBytes);
+    put16(ra + 4, 0x3fc0); /* 5 GHz OFDM legacy rates */
+    ra[6] = 0xff; /* HT MCS 0-7 */
+    ra[7] = 0xff; /* HT MCS 8-15 (2SS) */
+
+    uint8_t *st = ra + kRaBytes;
+    put16(st, 0x07); /* STA_REC_STATE */
+    put16(st + 2, kStateBytes);
+    st[8] = 2; /* Associated */
+    st[9] = 2 | (1u << 4); /* 80 MHz | 2SS */
+
+    if (!mcu_send_uni(MCU_UNI_CMD_STA_REC_UPDATE, ext, sizeof(ext), true)) {
+      log("WARNING: peer HE/RA STA_REC_UPDATE failed for wcid=" + std::to_string(wcid));
+    }
   }
   return true;
 }
@@ -2562,12 +2629,15 @@ bool MtkDevice::transmit(const uint8_t *frame, size_t len, const TxParams &param
   txwi[2] = field_prep(MT_TXD2_FRAME_TYPE, fc_type) |
             field_prep(MT_TXD2_SUB_TYPE, fc_stype) |
             field_prep(MT_TXD2_MULTICAST, multicast ? 1u : 0u) |
-            MT_TXD2_FIX_RATE | MT_TXD2_HTC_VLD;
+            (use_tx_ba ? 0u : (MT_TXD2_FIX_RATE | MT_TXD2_HTC_VLD));
   txwi[3] = field_prep(MT_TXD3_REM_TX_COUNT, no_ack ? 1u : 7u) |
             (use_tx_ba ? 0u : MT_TXD3_BA_DISABLE) | MT_TXD3_SN_VALID |
             field_prep(MT_TXD3_SEQ, (sc >> 4) & 0xfffu) |
             (no_ack ? MT_TXD3_NO_ACK : 0u);
-  if (params.is_vht) {
+  if (use_tx_ba) {
+    /* Let Connac2 firmware RA select HE80/VHT80 2SS MCS for HW TX BA frames. */
+    txwi[6] = 0;
+  } else if (params.is_vht) {
     txwi[6] = MT_TXD6_FIXED_BW | MT_TXD6_LDPC |
               field_prep(MT_TXD6_BW, params.bw) |
               field_prep(MT_TXD6_SGI, params.sgi ? 1u : 0u) |
