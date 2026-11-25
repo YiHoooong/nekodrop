@@ -452,10 +452,25 @@ public sealed class Supervisor : IDisposable
             // awdld connects to the radio's pipe; give the firmware time to boot.
             for (int i = 0; i < 100 && State == RadioState.Starting && _radio is { HasExited: false }; i++) Thread.Sleep(100);
             if (_radio is null || _radio.HasExited) throw new InvalidOperationException("the radio exited during bring-up: " + _detail);
-            string[] awdlArgs = _cfg.HighThroughput
-                ? ["-c", channel.ToString(), "-H", "-M", "1500"]
-                : ["-c", channel.ToString()];
-            _awdld = Spawn(Path.Combine(_root, "awdl", "awdld.exe"), awdlArgs, OnAwdldLine);
+            var owlyExe = Path.Combine(_root, "awdl", "owly.exe");
+            if (File.Exists(owlyExe))
+            {
+                var owlyEnv = new Dictionary<string, string>
+                {
+                    ["OWLY_WINTUN_DLL"] = Path.Combine(_root, "awdl", "wintun.dll"),
+                    ["OWLY_MTU"] = "1500",
+                    ["OWLY_NO_AMSDU"] = "0",
+                    ["RUST_LOG"] = "info",
+                };
+                _awdld = Spawn(owlyExe, ["radio", "up", "--channel", channel.ToString()], OnAwdldLine, owlyEnv);
+            }
+            else
+            {
+                string[] awdlArgs = _cfg.HighThroughput
+                    ? ["-c", channel.ToString(), "-H", "-M", "1500"]
+                    : ["-c", channel.ToString()];
+                _awdld = Spawn(Path.Combine(_root, "awdl", "awdld.exe"), awdlArgs, OnAwdldLine);
+            }
         }
         catch (Exception e)
         {
@@ -1307,7 +1322,7 @@ public sealed class Supervisor : IDisposable
         catch (Exception e) { Say("giving the card back failed: " + e.Message); }
     }
 
-    Process Spawn(string exe, IEnumerable<string> args, Action<string> onLine)
+    Process Spawn(string exe, IEnumerable<string> args, Action<string> onLine, IDictionary<string, string>? env = null)
     {
         var psi = new ProcessStartInfo(exe)
         {
@@ -1318,6 +1333,10 @@ public sealed class Supervisor : IDisposable
             RedirectStandardInput = true,
             WorkingDirectory = Path.GetDirectoryName(exe)!,
         };
+        if (env is not null)
+        {
+            foreach (var kv in env) psi.Environment[kv.Key] = kv.Value;
+        }
         foreach (var a in args) psi.ArgumentList.Add(a);
         var p = Process.Start(psi) ?? throw new InvalidOperationException("cannot start " + exe);
         p.ErrorDataReceived += (_, e) => { if (e.Data is not null) onLine(e.Data); };

@@ -48,6 +48,11 @@ Copy-Item "$mtkBuild\firmware\WIFI_MT7922_patch_mcu_1_1_hdr.bin", "$mtkBuild\fir
 & "$PSScriptRoot\build-awdl.ps1" -MinGW "$repo\third_party\winlibs\mingw64\bin" | Out-Null
 New-Item -ItemType Directory -Force "$stage\awdl" | Out-Null
 Copy-Item "$repo\third_party\winawdl\build\awdl\awdld.exe", "$repo\third_party\winawdl\deps\wintun\wintun.dll" "$stage\awdl\"
+$owlyExe = if ($env:OWLY_EXE) { $env:OWLY_EXE } else { Join-Path (Split-Path $repo -Parent) 'owly-win\target\release\owly.exe' }
+if (Test-Path $owlyExe) {
+  Copy-Item $owlyExe "$stage\awdl\owly.exe"
+  "  bundled owly.exe ($owlyExe)"
+}
 
 'airdrop engine'
 New-Item -ItemType Directory -Force "$stage\airdrop" | Out-Null
