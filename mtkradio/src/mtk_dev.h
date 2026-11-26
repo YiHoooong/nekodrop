@@ -105,6 +105,7 @@ public:
   bool start_monitor(uint8_t channel, unsigned width_mhz, const uint8_t address[6]);
   bool set_channel(uint8_t channel, unsigned width_mhz, uint8_t switch_reason = CH_SWITCH_NORMAL);
   bool set_address(const uint8_t address[6]);
+  void set_sniffer(bool enable);
 
   /* Second own address (own MAC 1, BSS 1) for the concurrent Wi-Fi station. */
   bool set_station_identity(const uint8_t addr[6], const uint8_t bssid[6]);

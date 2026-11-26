@@ -1595,24 +1595,6 @@ void MtkDevice::apply_rx_filter_mcu() {
   (void)mcu_send(MCU_CE_CMD_SET_RX_FILTER, 0, MCU_Q_SET, &rxfilter_req, sizeof(rxfilter_req),
                  false);
 
-  /* Enable Connac2 sniffer mode (MCU_UNI_CMD_SNIFFER = 0x24, tag 0 = UNI_SNIFFER_ENABLE)
-   * so MT7922 firmware forwards Beacons and Probe Responses to Host RX rings. */
-#pragma pack(push, 1)
-  struct {
-    uint8_t band_idx;
-    uint8_t pad[3];
-    uint16_t tag;
-    uint16_t len;
-    uint8_t enable;
-    uint8_t pad2[3];
-  } sniffer_req{};
-#pragma pack(pop)
-  sniffer_req.band_idx = 0;
-  sniffer_req.tag = 0; /* UNI_SNIFFER_ENABLE */
-  sniffer_req.len = 8;
-  sniffer_req.enable = 1;
-  (void)mcu_send_uni(0x24u, &sniffer_req, sizeof(sniffer_req), true);
-
   rxfilter_req = {};
   rxfilter_req.mode = 2;
   rxfilter_req.fif = 0;
@@ -1707,6 +1689,28 @@ bool MtkDevice::set_channel(uint8_t channel, unsigned width_mhz, uint8_t switch_
 bool MtkDevice::start_monitor(uint8_t channel, unsigned width_mhz, const uint8_t address[6]) {
   if (!set_address(address)) return false;
   return set_channel(channel, width_mhz);
+}
+
+void MtkDevice::set_sniffer(bool enable) {
+#pragma pack(push, 1)
+  struct {
+    uint8_t band_idx;
+    uint8_t pad[3];
+    uint16_t tag;
+    uint16_t len;
+    uint8_t enable;
+    uint8_t pad2[3];
+  } req{};
+#pragma pack(pop)
+  req.band_idx = 0;
+  req.tag = 0; /* UNI_SNIFFER_ENABLE */
+  req.len = 8;
+  req.enable = enable ? 1u : 0u;
+  (void)mcu_send_uni(0x24u, &req, sizeof(req), true);
+  if (!enable) {
+    apply_rx_filter_mcu();
+    restore_rx_filter();
+  }
 }
 
 /* --------------------------------------------------------------------------
