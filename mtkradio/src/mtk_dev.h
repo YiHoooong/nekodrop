@@ -240,6 +240,12 @@ private:
     int8_t dbm;
     uint8_t channel;
   };
+  struct TxTokenSlot {
+    bool in_flight = false;
+    uint64_t ts_ms = 0;
+  };
+  static constexpr uint16_t kTxBaTokenBase = 64u;
+  static constexpr size_t kTxBaTokenSlots = 64u;
 
   Logger _log;
   TxStatusHandler _on_tx_status;
@@ -279,6 +285,11 @@ private:
   std::vector<uint8_t> _rx_pkt_buf;
   std::vector<uint8_t> _rx_unpad_buf;
   std::deque<DeferredRx> _deferred_rx;
+
+  std::array<DmaBuf, kTxBaTokenSlots> _tx_ba_bufs{};
+  std::array<TxTokenSlot, kTxBaTokenSlots> _tx_ba_tokens{};
+  size_t _tx_ba_in_flight = 0;
+  size_t _tx_ba_next_slot = 0;
 };
 
 } // namespace mtk

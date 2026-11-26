@@ -661,6 +661,19 @@ bool MtkDevice::dma_init(std::string &error) {
   if (!alloc_rx_ring(_rx_mcu_wa, MT_RX_MCU_WA_RING_BASE, 128, error)) return false;
   if (!alloc_rx_ring(_rx_data, MT_RX_DATA_RING_BASE, 512, error)) return false;
 
+  /* 64 dedicated 4 KiB DMA payload pages for TX BA token slots so each in-flight
+   * frame's payload stays immutable until hardware releases its token via TX_FREE. */
+  for (size_t i = 0; i < kTxBaTokenSlots; i++) {
+    _tx_ba_bufs[i] = _dma.alloc_page();
+    if (!_tx_ba_bufs[i]) {
+      error = "failed to allocate 32-bit DMA TX BA token payload page";
+      return false;
+    }
+  }
+  _tx_ba_tokens.fill(TxTokenSlot{});
+  _tx_ba_in_flight = 0;
+  _tx_ba_next_slot = 0;
+
   _dma.trim();
   log("WFDMA rings allocated (" + std::to_string(_dma.pages_used()) + " pages used)");
 
@@ -2690,8 +2703,6 @@ bool MtkDevice::transmit(const uint8_t *frame, size_t len, const TxParams &param
   if (next == _tx_data.tail) return false;
 
   const uint32_t idx = _tx_data.head;
-  std::memcpy(_tx_data.bufs[idx].va, frame, len);
-
   const uint16_t fc = static_cast<uint16_t>(frame[0] | (frame[1] << 8));
   const uint16_t sc = static_cast<uint16_t>(frame[22] | (frame[23] << 8));
   const uint8_t fc_type = static_cast<uint8_t>((fc >> 2) & 0x3u);
@@ -2716,6 +2727,35 @@ bool MtkDevice::transmit(const uint8_t *frame, size_t len, const TxParams &param
       use_tx_ba = _peers[peer_wcid].tx_ba_active[tid];
     }
   }
+
+  /* Pace TX BA frames to 64 in-flight tokens with dedicated DMA payload pages
+   * so high-rate SHM bursts never overwrite in-flight A-MPDU payloads. */
+  size_t ba_slot = 0;
+  uint16_t token = 0;
+  if (use_tx_ba) {
+    bool found = false;
+    for (size_t i = 0; i < kTxBaTokenSlots; i++) {
+      const size_t s = (_tx_ba_next_slot + i) % kTxBaTokenSlots;
+      if (!_tx_ba_tokens[s].in_flight) {
+        ba_slot = s;
+        _tx_ba_next_slot = (s + 1) % kTxBaTokenSlots;
+        found = true;
+        break;
+      }
+    }
+    if (!found) return false;
+    _tx_ba_tokens[ba_slot].in_flight = true;
+    _tx_ba_tokens[ba_slot].ts_ms = now_ms();
+    _tx_ba_in_flight++;
+    token = static_cast<uint16_t>(kTxBaTokenBase + ba_slot);
+  } else {
+    if (_tx_token < 128u || _tx_token >= 8191u) _tx_token = 128u;
+    else _tx_token++;
+    token = _tx_token;
+  }
+
+  const DmaBuf &payload_buf = use_tx_ba ? _tx_ba_bufs[ba_slot] : _tx_data.bufs[idx];
+  std::memcpy(payload_buf.va, frame, len);
 
   auto *txwi = reinterpret_cast<uint32_t *>(_tx_data.txwi[idx].va);
   std::memset(txwi, 0, MT_TXD_SIZE + sizeof(MtkHwTxp));
@@ -2760,9 +2800,8 @@ bool MtkDevice::transmit(const uint8_t *frame, size_t len, const TxParams &param
             field_prep(MT_TXD7_SPE_IDX, 24u);
 
   auto *txp = reinterpret_cast<MtkHwTxp *>(_tx_data.txwi[idx].va + MT_TXD_SIZE);
-  _tx_token = (_tx_token + 1) & 0x1fffu;
-  txp->msdu_id[0] = static_cast<uint16_t>(_tx_token | MT_MSDU_ID_VALID);
-  txp->ptr[0].buf0 = _tx_data.bufs[idx].pa;
+  txp->msdu_id[0] = static_cast<uint16_t>(token | MT_MSDU_ID_VALID);
+  txp->ptr[0].buf0 = payload_buf.pa;
   txp->ptr[0].len0 = static_cast<uint16_t>((len & MT_TXD_LEN_MASK) | MT_TXD_LEN_LAST);
 
   MtkDesc *d = _tx_data.descs();
@@ -2871,6 +2910,13 @@ void MtkDevice::handle_tx_free(const uint8_t *data, size_t len) { /* mt7921_mac_
     const unsigned msdu = static_cast<unsigned>(field_get(MT_TX_FREE_MSDU_ID, v));
     const unsigned stat = static_cast<unsigned>(field_get(MT_TX_FREE_STATUS, v));
     const unsigned tries = static_cast<unsigned>(field_get(MT_TX_FREE_COUNT, v));
+    if (msdu >= kTxBaTokenBase && msdu < kTxBaTokenBase + kTxBaTokenSlots) {
+      const size_t slot = static_cast<size_t>(msdu - kTxBaTokenBase);
+      if (_tx_ba_tokens[slot].in_flight) {
+        _tx_ba_tokens[slot].in_flight = false;
+        if (_tx_ba_in_flight > 0) --_tx_ba_in_flight;
+      }
+    }
     if (_on_tx_status) _on_tx_status(msdu, stat == 0, tries);
   }
 }
@@ -2934,6 +2980,16 @@ size_t MtkDevice::poll(const RxHandler &on_rx) {
   /* MT7921/MT7922 delivers 802.11 frames on both RX ring 2 (data) and ring 4 (MCU/mgmt). */
   drain_rx(_rx_data);
   drain_rx(_rx_mcu_wa);
+  if (_tx_ba_in_flight > 0) {
+    const uint64_t now = now_ms();
+    for (size_t i = 0; i < kTxBaTokenSlots; i++) {
+      if (_tx_ba_tokens[i].in_flight && now >= _tx_ba_tokens[i].ts_ms &&
+          (now - _tx_ba_tokens[i].ts_ms) > 200u) {
+        _tx_ba_tokens[i].in_flight = false;
+        if (_tx_ba_in_flight > 0) --_tx_ba_in_flight;
+      }
+    }
+  }
   return count;
 }
 

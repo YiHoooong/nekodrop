@@ -962,7 +962,7 @@ int main(int argc, char **argv) {
           const bool to_sched_peer = !no_block_ack && is_data && is_unicast && have_sched_peer &&
                                      std::memcmp(frame + 4, sched_peer, 6) == 0;
           if (to_sched_peer && sched.known()) {
-            if (unicast_q.size() >= kUnicastQueueMax) unicast_q.pop_front();
+            if (unicast_q.size() >= kUnicastQueueMax) break;
             unicast_q.push_back({std::vector<uint8_t>(frame, frame + flen), tx_params});
           } else {
             if (!dev.transmit(frame, flen, tx_params, false)) break;
