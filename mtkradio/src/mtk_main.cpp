@@ -646,6 +646,7 @@ int main(int argc, char **argv) {
     for (uint8_t c = 149; c <= 165; c += 4) scan.channels.push_back(c);
     // The MT792x Concurrent station can join only 5 GHz; probing 2.4 GHz
     // here would waste off-channel time producing results the service discards.
+    dev.set_sniffer(true);
     log_line("event: scan-started");
   };
 
@@ -658,6 +659,7 @@ int main(int argc, char **argv) {
     if (scan.background && (scan.next == 0 || scan.home) && last_awdl_data_us &&
         t - last_awdl_data_us < 3000000u) {
       scan.active = false;
+      dev.set_sniffer(false);
       log_line("scan: yielded to AirDrop traffic");
       log_line("event: scan-interrupted air-drop");
       return true;
@@ -680,6 +682,7 @@ int main(int argc, char **argv) {
     if (scan.until != Clock::time_point{} && now < scan.until) return false;
     if (scan.next >= scan.channels.size()) {
       scan.active = false;
+      dev.set_sniffer(false);
       std::string heard;
       for (const auto &[ch, c] : scan.heard) {
         heard += " " + std::to_string(ch) + ":" + std::to_string(c.first) + "/" +
@@ -714,6 +717,7 @@ int main(int argc, char **argv) {
       if (dev.channel() != awdl_channel || dev.width_mhz() != (awdl_channel > 14 ? width : 20u)) {
         if (!dev.set_channel(awdl_channel, awdl_channel > 14 ? width : 20u)) {
           scan.active = false;
+          dev.set_sniffer(false);
           move_failed = true;
           move_retry_at = Clock::now() + std::chrono::milliseconds(500);
           log_fmt("scan: could not return to AWDL channel %u", awdl_channel);
@@ -959,12 +963,16 @@ int main(int argc, char **argv) {
               }
             }
           }
-          const bool to_sched_peer = !no_block_ack && is_data && is_unicast && have_sched_peer &&
-                                     std::memcmp(frame + 4, sched_peer, 6) == 0;
+          const bool to_sched_peer = false; /* owly.exe runs its own AWDL schedule; send directly without double-gating */
           if (to_sched_peer && sched.known()) {
             if (unicast_q.size() >= kUnicastQueueMax) break;
             unicast_q.push_back({std::vector<uint8_t>(frame, frame + flen), tx_params});
           } else {
+            if (flen < 16 || flen > 4096) {
+              log_fmt("tx: dropping oversized/undersized frame len=%zu", flen);
+              awdl_tx_q.pop_front();
+              continue;
+            }
             if (!dev.transmit(frame, flen, tx_params, false)) break;
             tx_sent++;
           }
@@ -1046,9 +1054,11 @@ int main(int argc, char **argv) {
         last_awdl_data_us = heard;
       }
 
-      /* Auto-answer 802.11 ADDBA Request (awdld/OWL does not send ADDBA Response,
-       * so without this MT7922 never activates HW RX BlockAck / A-MPDU). */
-      if (!no_block_ack && on_awdl_ch && f.len >= 33 && (f.data[0] & 0xfcu) == 0xd0u &&
+      /* Auto-answer 802.11 ADDBA Request with amsdu=0 and reorder in mtkradio:
+       * MT7922 Connac2 splits RX A-MSDUs into per-subframe descriptors with identical
+       * 802.11 SN, which would cause owly's BA reorder to drop 50% as duplicates. */
+      const bool mtkradio_ba = !no_block_ack;
+      if (mtkradio_ba && on_awdl_ch && f.len >= 33 && (f.data[0] & 0xfcu) == 0xd0u &&
           std::memcmp(f.data + 4, own_mac.data(), 6) == 0 && f.data[24] == 3u &&
           f.data[25] == 0u) {
         const uint8_t token = f.data[26];
@@ -1098,7 +1108,7 @@ int main(int argc, char **argv) {
                               });
         }
         return;
-      } else if (!no_block_ack && on_awdl_ch && f.len >= 20 && f.data[0] == 0x84u &&
+      } else if (mtkradio_ba && on_awdl_ch && f.len >= 20 && f.data[0] == 0x84u &&
                  std::memcmp(f.data + 4, own_mac.data(), 6) == 0) {
         ba_reorder.on_bar(f.data, f.len, heard,
                           [&](const uint8_t *d, size_t n, uint8_t ch, int8_t rssi) {
@@ -1111,7 +1121,7 @@ int main(int argc, char **argv) {
       if (filter_active && f.len >= 22 && std::memcmp(f.data + 16, bssid_filter.data(), 6) != 0) {
         return;
       }
-      if (!no_block_ack && on_awdl_ch && f.len >= 26 && (f.data[0] & 0x8cu) == 0x88u &&
+      if (mtkradio_ba && on_awdl_ch && f.len >= 26 && (f.data[0] & 0x8cu) == 0x88u &&
           std::memcmp(f.data + 4, own_mac.data(), 6) == 0) {
         if (ba_reorder.process(f.data, f.len, f.channel, f.dbm, heard,
                                [&](const uint8_t *d, size_t n, uint8_t ch, int8_t rssi) {
@@ -1193,11 +1203,13 @@ int main(int argc, char **argv) {
     }
 
     if (Clock::now() - last_report > std::chrono::seconds(10)) {
-      log_fmt("rx: %llu frames, %llu awdl, %llu addressed to us; tx: %llu acked, %llu failed",
+      const std::string txd = dev.tx_diag();
+      log_fmt("rx: %llu frames, %llu awdl, %llu addressed to us; tx: %llu acked, %llu failed (q=%zu sent=%llu %s)",
               static_cast<unsigned long long>(rx_total), static_cast<unsigned long long>(rx_awdl),
               static_cast<unsigned long long>(rx_to_us),
               static_cast<unsigned long long>(awdl_tx_acked),
-              static_cast<unsigned long long>(awdl_tx_failed));
+              static_cast<unsigned long long>(awdl_tx_failed), awdl_tx_q.size(),
+              static_cast<unsigned long long>(tx_sent), txd.c_str());
       if (sta && sta_dev) {
         const MtkStation::Stats &s = sta_dev->stats();
         unsigned router = 0;

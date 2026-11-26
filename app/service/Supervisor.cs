@@ -459,7 +459,8 @@ public sealed class Supervisor : IDisposable
                 {
                     ["OWLY_WINTUN_DLL"] = Path.Combine(_root, "awdl", "wintun.dll"),
                     ["OWLY_MTU"] = "1500",
-                    ["OWLY_NO_AMSDU"] = "0",
+                    ["OWLY_NO_AMSDU"] = "1",
+                    ["OWLY_CONTINUOUS_TX"] = "1",
                     ["RUST_LOG"] = "info",
                 };
                 _awdld = Spawn(owlyExe, ["radio", "up", "--channel", channel.ToString()], OnAwdldLine, owlyEnv);

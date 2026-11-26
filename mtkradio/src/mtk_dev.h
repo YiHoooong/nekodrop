@@ -105,6 +105,7 @@ public:
   bool start_monitor(uint8_t channel, unsigned width_mhz, const uint8_t address[6]);
   bool set_channel(uint8_t channel, unsigned width_mhz, uint8_t switch_reason = CH_SWITCH_NORMAL);
   bool set_address(const uint8_t address[6]);
+  void set_sniffer(bool enable);
 
   /* Second own address (own MAC 1, BSS 1) for the concurrent Wi-Fi station. */
   bool set_station_identity(const uint8_t addr[6], const uint8_t bssid[6]);
@@ -147,6 +148,10 @@ public:
   uint32_t hw_rev() const { return _hw_rev; }
   uint8_t channel() const { return _channel; }
   unsigned width_mhz() const { return _width_mhz; }
+  std::string tx_diag() const {
+    return "h=" + std::to_string(_tx_data.head) + " t=" + std::to_string(_tx_data.tail) +
+           " ba=" + std::to_string(_tx_ba_in_flight);
+  }
 
   /* Low-level register helpers (exposed for diagnostics). */
   uint32_t rr(uint32_t addr);
